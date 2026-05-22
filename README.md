@@ -155,39 +155,27 @@ Important:
 
 - New uploads store **`publication`** and **`class`** only (no `book_type`, `author`, `grade`, or `source_id`). Queries still match legacy indexes via `$or` on the new and old field names where applicable.
 
-## 7) External cron (every 15 minutes)
+## 7) In-process keep-alive (built-in)
 
-Keep the API running with `uvicorn` (or a process manager). Use a **separate** scheduler to HTTP-call the API — do not restart uvicorn on a schedule.
+The app runs an internal `asyncio` loop (started from FastAPI's `lifespan` in `app/main.py`) that issues a `GET` against a configured URL on a fixed interval. There is **no external scheduler, no `/internal/cron` route, and no shared secret** anymore.
 
-1. Set a strong `CRON_SECRET` in `.env` (see `.env.example`).
-2. Restart the API after changing `.env`.
-3. Point your scheduler at **`GET /internal/cron/ping`** with header **`X-Cron-Secret: <same value>`**.
+Configure with two env vars:
 
-Public **`GET /health`** stays unauthenticated for simple uptime checks. The cron route requires `CRON_SECRET` on the server.
-
-```bash
-curl -H "X-Cron-Secret: YOUR_SECRET" http://127.0.0.1:8000/internal/cron/ping
+```
+KEEPALIVE_URL=https://your-app.onrender.com/health
+KEEPALIVE_INTERVAL_SECONDS=600
 ```
 
-### Windows Task Scheduler
+- Leave `KEEPALIVE_URL` blank to disable the loop entirely (no background task is spawned).
+- `KEEPALIVE_INTERVAL_SECONDS` minimum is **5s** (lower values are clamped). Defaults to `600` (10 min).
+- Point `KEEPALIVE_URL` at the **public** URL (not `127.0.0.1`) — only public traffic goes through Render's load balancer.
+- The loop logs every ping under the `keepalive` logger; check `logs/app.log` to verify.
 
-```powershell
-$env:API_BASE_URL = "http://127.0.0.1:8000"
-$env:CRON_SECRET = "YOUR_SECRET"
-.\scripts\cron-ping.ps1
-```
+Caveats:
 
-Create a task: trigger **Daily**, repeat every **15 minutes** indefinitely; action:
-
-`powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\schoolknowledgebase\scripts\cron-ping.ps1`
-
-Set `API_BASE_URL` and `CRON_SECRET` in the task’s environment (or system/user variables).
-
-### Linux crontab
-
-```cron
-*/15 * * * * API_BASE_URL=https://your-api.example.com CRON_SECRET=YOUR_SECRET /path/to/schoolknowledgebase/scripts/cron-ping.sh >> /var/log/schoolkb-cron.log 2>&1
-```
+- If you run `uvicorn --workers N`, **each worker starts its own loop** (N× pings). Use a single worker or gate the loop yourself if that matters.
+- Free-tier sleep on Render is not officially documented as "any inbound request resets it". A self-ping reduces cold starts in practice but is not a hard guarantee — an external pinger (cron-job.org, UptimeRobot) is still more reliable if uptime is critical.
+- Public `GET /health` stays unauthenticated for uptime checks.
 
 ## 8) Notes
 

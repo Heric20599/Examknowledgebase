@@ -20,8 +20,10 @@ class Settings(BaseSettings):
     chunk_overlap: int = 120
     max_pdf_mb: int = 50
 
-    # Shared secret for GET /internal/cron/ping (external Task Scheduler / crontab).
-    cron_secret: str | None = None
+    # In-process keep-alive loop. If keepalive_url is set, the app pings it on
+    # an interval from inside the FastAPI lifespan. Leave blank to disable.
+    keepalive_url: str | None = None
+    keepalive_interval_seconds: int = 600
 
 
 @lru_cache

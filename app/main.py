@@ -1,20 +1,45 @@
+import asyncio
 from contextlib import asynccontextmanager
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.deps import build_openai_client, build_pinecone_client, ensure_pinecone_index
 from app.errors import AppError
 from app.routers.admin import router as admin_router
 from app.routers.catalog import router as catalog_router
-from app.routers.cron import router as cron_router
 from app.routers.exam import router as exam_router
 from app.routers.ingest import router as ingest_router
+
+
+async def _keepalive_loop(settings: Settings) -> None:
+    # Hits settings.keepalive_url every settings.keepalive_interval_seconds.
+    # NOTE: with `uvicorn --workers N`, each worker runs its own loop.
+    url = (settings.keepalive_url or "").strip()
+    interval = max(5, int(settings.keepalive_interval_seconds))
+    if not url:
+        return
+    log = logging.getLogger("keepalive")
+    log.info("keepalive started url=%s interval=%ss", url, interval)
+    async with httpx.AsyncClient(timeout=15) as client:
+        while True:
+            try:
+                resp = await client.get(url)
+                log.info("keepalive ping status=%s", resp.status_code)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("keepalive ping failed: %s", exc)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
 
 
 @asynccontextmanager
@@ -49,7 +74,22 @@ async def lifespan(app: FastAPI):
     app.state.openai = build_openai_client(settings)
     app.state.pinecone = build_pinecone_client(settings)
     ensure_pinecone_index(settings, app.state.pinecone)
-    yield
+
+    keepalive_task: asyncio.Task | None = None
+    if (settings.keepalive_url or "").strip():
+        keepalive_task = asyncio.create_task(
+            _keepalive_loop(settings), name="keepalive"
+        )
+
+    try:
+        yield
+    finally:
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(title="School Knowledge Base RAG API", lifespan=lifespan)
@@ -115,4 +155,3 @@ app.include_router(ingest_router)
 app.include_router(catalog_router)
 app.include_router(admin_router)
 app.include_router(exam_router)
-app.include_router(cron_router)
