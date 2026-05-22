@@ -5,8 +5,9 @@ from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field
 
 from app.schemas.common import Difficulty, QuestionType
 
-# MTF: exactly one left–right pair per question (API contract).
-MTF_MAX_MATCH_PAIRS = 1
+# MTF: one block per (type, difficulty) row, holding N pairs under a shared
+# `instruction`. Upper bound aligns with QuestionTypeSpec.numberOfQuestions ≤ 50.
+MTF_MAX_MATCH_PAIRS = 50
 
 
 def _int_like(v: Any) -> int:
@@ -94,9 +95,19 @@ class QuestionOption(BaseModel):
 
 
 class MatchPair(BaseModel):
-    leftText: str
-    pairKey: str
+    pairKey: str = Field(
+        default="",
+        description="Short label for the pair (A, B, C, ...); assigned by the server per displayOrder.",
+    )
+    leftText: str = Field(description="Left-column item (Column A).")
+    rightText: str = Field(default="", description="Right-column item (Column B) that matches `leftText`.")
     displayOrder: int
+
+
+class MTFInnerQuestion(BaseModel):
+    questionCode: str
+    displayOrder: int
+    matchPairs: list[MatchPair] = Field(min_length=1, max_length=MTF_MAX_MATCH_PAIRS)
 
 
 class MCQQuestion(BaseModel):
@@ -137,12 +148,25 @@ class FIBQuestion(BaseModel):
 
 
 class MTFQuestion(BaseModel):
+    """Match-the-following block.
+
+    One MTF block per (type, difficulty) row in the payload. The block carries a
+    shared `instruction` heading and one inner question holding all `matchPairs`
+    for that row. `numberOfQuestions` from the payload row equals
+    `questions[0].matchPairs` length.
+    """
+
     type: Literal["MTF"] = "MTF"
-    questionCode: str
     difficulty: Difficulty
-    text: str
-    displayOrder: int
-    matchPairs: list[MatchPair] = Field(min_length=1, max_length=MTF_MAX_MATCH_PAIRS)
+    instruction: str = Field(
+        default="Match the items in Column A with Column B.",
+        description="Shared heading shown above the table of pairs.",
+    )
+    questions: list[MTFInnerQuestion] = Field(
+        min_length=1,
+        max_length=1,
+        description="Exactly one inner question holding the N matchPairs for this MTF row.",
+    )
 
 
 class DESQuestion(BaseModel):
