@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     chunk_overlap: int = 120
     max_pdf_mb: int = 50
 
+    # Shared secret for GET /internal/cron/ping (external Task Scheduler / crontab).
+    cron_secret: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

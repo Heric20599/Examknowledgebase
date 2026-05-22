@@ -12,6 +12,7 @@ from app.deps import build_openai_client, build_pinecone_client, ensure_pinecone
 from app.errors import AppError
 from app.routers.admin import router as admin_router
 from app.routers.catalog import router as catalog_router
+from app.routers.cron import router as cron_router
 from app.routers.exam import router as exam_router
 from app.routers.ingest import router as ingest_router
 
@@ -114,3 +115,4 @@ app.include_router(ingest_router)
 app.include_router(catalog_router)
 app.include_router(admin_router)
 app.include_router(exam_router)
+app.include_router(cron_router)

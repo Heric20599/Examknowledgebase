@@ -155,7 +155,41 @@ Important:
 
 - New uploads store **`publication`** and **`class`** only (no `book_type`, `author`, `grade`, or `source_id`). Queries still match legacy indexes via `$or` on the new and old field names where applicable.
 
-## 7) Notes
+## 7) External cron (every 15 minutes)
+
+Keep the API running with `uvicorn` (or a process manager). Use a **separate** scheduler to HTTP-call the API — do not restart uvicorn on a schedule.
+
+1. Set a strong `CRON_SECRET` in `.env` (see `.env.example`).
+2. Restart the API after changing `.env`.
+3. Point your scheduler at **`GET /internal/cron/ping`** with header **`X-Cron-Secret: <same value>`**.
+
+Public **`GET /health`** stays unauthenticated for simple uptime checks. The cron route requires `CRON_SECRET` on the server.
+
+```bash
+curl -H "X-Cron-Secret: YOUR_SECRET" http://127.0.0.1:8000/internal/cron/ping
+```
+
+### Windows Task Scheduler
+
+```powershell
+$env:API_BASE_URL = "http://127.0.0.1:8000"
+$env:CRON_SECRET = "YOUR_SECRET"
+.\scripts\cron-ping.ps1
+```
+
+Create a task: trigger **Daily**, repeat every **15 minutes** indefinitely; action:
+
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\schoolknowledgebase\scripts\cron-ping.ps1`
+
+Set `API_BASE_URL` and `CRON_SECRET` in the task’s environment (or system/user variables).
+
+### Linux crontab
+
+```cron
+*/15 * * * * API_BASE_URL=https://your-api.example.com CRON_SECRET=YOUR_SECRET /path/to/schoolknowledgebase/scripts/cron-ping.sh >> /var/log/schoolkb-cron.log 2>&1
+```
+
+## 8) Notes
 
 - **`GET /books`** returns both the **`books`** list and **`classes` / `subjects` / `publications`** for the same filtered view. Use **`count`** as the number of books (no separate `options` flag).
 
