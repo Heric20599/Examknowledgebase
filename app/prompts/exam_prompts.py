@@ -14,20 +14,25 @@ def build_exam_prompt(payload: dict, context_chunks: list[dict]) -> str:
 
     # Count top-level question objects in the response.
     #   - non-MTF rows  : `numberOfQuestions` separate question objects.
-    #   - MTF rows      : ONE MTF block whose inner question holds `numberOfQuestions` pairs.
-    # Total top-level blocks = sum of (n if non-MTF else 1) across rows.
+    #   - all MTF rows  : ONE MTF block total; each row becomes one `sections[]` entry.
+    # Total top-level blocks = sum of (n if non-MTF else 0) + (1 if any MTF row else 0).
     qts = payload.get("questionTypes") or []
     row_lines: list[str] = []
     total_blocks = 0
+    has_mtf = False
+    mtf_section_lines: list[str] = []
     for i, row in enumerate(qts, start=1):
         n = int(row.get("numberOfQuestions") or 0)
         t = str(row.get("type") or "").upper()
         diff = row.get("difficultyLevel")
         if t == "MTF":
-            total_blocks += 1
+            has_mtf = True
+            mtf_section_lines.append(
+                f"    - section difficulty={diff} with EXACTLY {n} matchPairs"
+            )
             row_lines.append(
                 f"  Row {i}: type=MTF difficulty={diff} numberOfQuestions={n}"
-                f"  ->  emit 1 MTF block whose inner question has EXACTLY {n} matchPairs"
+                f"  ->  one section inside the single MTF block (EXACTLY {n} pairs)"
             )
         else:
             total_blocks += n
@@ -35,7 +40,10 @@ def build_exam_prompt(payload: dict, context_chunks: list[dict]) -> str:
                 f"  Row {i}: type={t} difficulty={diff} numberOfQuestions={n}"
                 f"  ->  emit EXACTLY {n} separate top-level {t} questions"
             )
+    if has_mtf:
+        total_blocks += 1
     breakdown = "\n".join(row_lines) if row_lines else "  (none)"
+    mtf_sections_breakdown = "\n".join(mtf_section_lines) if mtf_section_lines else "    (none)"
     # Kept for prompt text references that read more naturally as "questions" than "blocks".
     total_required = total_blocks
 
@@ -96,19 +104,19 @@ Exact question count (HARD CONSTRAINT — NO HALLUCINATION):
 - For non-MTF rows (MCQ / TOF / FIB / DES): the number of top-level question
   objects whose `type` matches AND whose `difficulty` matches that row's
   `difficultyLevel` MUST equal that row's `numberOfQuestions`.
-- For MTF rows: emit EXACTLY ONE top-level MTF block per row. That block's
-  inner `questions[0].matchPairs` MUST contain EXACTLY `numberOfQuestions` pairs.
+- For MTF rows: emit EXACTLY ONE top-level MTF block for ALL MTF rows combined.
+  Each MTF payload row becomes one entry in `sections[]` (difficulty + matchPairs).
+  Put `instruction` ONCE on the outer MTF block only — sections do NOT repeat it.
 - Do NOT emit ANY question whose `(type, difficulty)` is not one of the rows
-  above. If the payload has only MTF rows, emit ONLY MTF blocks — do NOT add
+  above. If the payload has only MTF rows, emit ONLY one MTF block — do NOT add
   MCQ, TOF, FIB, or DES "to balance out" the exam. The server drops any such
   unrequested questions.
 - Do NOT generate extra questions, even if the context supports more.
 - Do NOT skip questions, even if the context seems thin — rephrase from context.
-- Do NOT merge two requested questions into one. Do NOT split one into two.
+- Do NOT merge two requested non-MTF questions into one. Do NOT split one into two.
 - `questionCode` is a single GLOBAL sequence across the whole exam: Q1, Q2, ...,
-  Q{total_blocks}. No duplicates, no gaps, no resets per type. For MTF blocks
-  the `questionCode` goes on the inner question (`questions[0].questionCode`),
-  NOT on the top-level MTF object.
+  Q{total_blocks}. No duplicates, no gaps. The MTF block gets one questionCode
+  like any other top-level question.
 
 Rules:
 - Respect exact numberOfQuestions per type and difficulty (each questionTypes row: 1–50 questions).
@@ -120,36 +128,45 @@ Rules:
 - MCQ options must be objects with: optionLabel, text, displayOrder. You MUST also set `correctOption` to the optionLabel of the one correct choice (e.g. `"B"`).
 - TOF: set boolean `answer` (true if the statement is correct, false if incorrect). Put the statement text in `text` (or legacy `statement` which is copied to `text`).
 - FIB: include `text` (stem with _____ or clear blanks) and `answers` only; do not include a `blanks` field in output.
-- MTF: ONE PAYLOAD MTF ROW PRODUCES EXACTLY ONE TOP-LEVEL MTF BLOCK.
-  `numberOfQuestions` for an MTF row is the number of PAIRS in that single
-  block, NOT the number of blocks. Never split one MTF row into multiple blocks.
+- MTF: ALL MTF PAYLOAD ROWS → EXACTLY ONE TOP-LEVEL MTF BLOCK.
+  `numberOfQuestions` on each MTF row is the pair count for that row's section,
+  NOT the number of top-level blocks.
 
-  Required shape of an MTF block (top-level keys exactly):
-    type:        "MTF"
-    difficulty:  the row's `difficultyLevel`
-    instruction: shared heading shown once above the table
-                 (e.g. "Match the items in Column A with Column B.")
-    questions:   a list of EXACTLY ONE inner object with:
-                   questionCode: global Q-sequence value
-                   displayOrder: global sequence value
-                   matchPairs:   list of length EXACTLY `numberOfQuestions`
+  Required shape of the single MTF block (top-level keys exactly):
+    type:         "MTF"
+    questionCode: global Q-sequence value
+    displayOrder: global sequence value
+    instruction:  shared heading ONCE (e.g. "Match the following")
+    sections:     one entry per MTF payload row, in payload order:
+                    difficulty:  that row's `difficultyLevel`
+                    matchPairs:  list of length EXACTLY that row's `numberOfQuestions`
                                  each pair = {{leftText, rightText, displayOrder, pairKey}}
-                                 pairKey is "A","B","C",... by displayOrder
-                                 (the server will overwrite labels if needed)
+                                 pairKey is "A","B","C",... restarting per section
 
-  Do NOT put `text`, `questionCode`, or `displayOrder` on the top-level MTF block.
-  Do NOT repeat the `instruction` per pair.
+  Sections carry ONLY `difficulty` and `matchPairs` — no instruction, no questionCode.
+  Do NOT repeat `instruction` on sections or pairs.
+  Do NOT emit multiple top-level MTF blocks when the payload has multiple MTF rows.
 
-  WORKED EXAMPLE — payload row {{"type":"MTF","difficultyLevel":"HARD","numberOfQuestions":3}}:
-    CORRECT (1 block, 3 pairs in matchPairs):
+  MTF sections required for this payload:
+{mtf_sections_breakdown}
+
+  WORKED EXAMPLE — payload rows MTF EASY×2 and MTF HARD×3:
+    CORRECT (1 top-level MTF block, 2 sections):
       {{
         "type": "MTF",
-        "difficulty": "HARD",
-        "instruction": "Match the items in Column A with Column B.",
-        "questions": [
+        "questionCode": "Q1",
+        "displayOrder": 1,
+        "instruction": "Match the following",
+        "sections": [
           {{
-            "questionCode": "Q1",
-            "displayOrder": 1,
+            "difficulty": "EASY",
+            "matchPairs": [
+              {{"pairKey":"A","leftText":"...","rightText":"...","displayOrder":1}},
+              {{"pairKey":"B","leftText":"...","rightText":"...","displayOrder":2}}
+            ]
+          }},
+          {{
+            "difficulty": "HARD",
             "matchPairs": [
               {{"pairKey":"A","leftText":"...","rightText":"...","displayOrder":1}},
               {{"pairKey":"B","leftText":"...","rightText":"...","displayOrder":2}},
@@ -159,13 +176,11 @@ Rules:
         ]
       }}
 
-    WRONG (3 blocks, each with its own matchPairs) — DO NOT EMIT THIS:
-      [{{ "type":"MTF", ..., "matchPairs":[...] }},
-       {{ "type":"MTF", ..., "matchPairs":[...] }},
-       {{ "type":"MTF", ..., "matchPairs":[...] }}]
+    WRONG — multiple top-level MTF blocks (DO NOT EMIT):
+      [{{ "type":"MTF", "instruction":"Match the following", ... }},
+       {{ "type":"MTF", "instruction":"Match the following", ... }}]
 
-    WRONG (1 block but matchPairs of length 9 or 1) — DO NOT EMIT THIS.
-    matchPairs length MUST equal `numberOfQuestions` exactly (3 in this example).
+    WRONG — instruction repeated on each section (DO NOT EMIT).
 - DES: put ONLY the learner-facing prompt in `text`. Put marking content in `modelAnswer` only (if the model emits rubric bullets in `keyPoints` or `rubric`, the server merges them into `modelAnswer`; clients do not see `keyPoints`).
 - At the root, include strings `summary` and `analysis` for the model only; the API merges them into `description` in this order: (1) exam summary, (2) exam analytics, (3) the request `description` / teacher instructions last. Clients only see the single `description` field.
 
@@ -183,11 +198,11 @@ Final self-check before emitting JSON:
 - len(top-level questions[]) == {total_blocks}.
 - For each non-MTF row, count of top-level questions with matching (type, difficulty)
   equals that row's `numberOfQuestions`.
-- For each MTF row, there is EXACTLY ONE top-level MTF block with matching
-  `difficulty`, and that block's `questions[0].matchPairs` length equals that
-  row's `numberOfQuestions`.
-- Every MTF block has the keys exactly: type, difficulty, instruction, questions.
-  Every MTF inner question has exactly: questionCode, displayOrder, matchPairs.
+- For each MTF payload row, the matching `sections[]` entry has that row's
+  `difficultyLevel` and `matchPairs` length equals that row's `numberOfQuestions`.
+- There is EXACTLY ONE top-level MTF block when the payload has any MTF rows.
+- Every MTF block has exactly: type, questionCode, displayOrder, instruction, sections.
+  Every section has exactly: difficulty, matchPairs.
   Every matchPair has exactly: pairKey, leftText, rightText, displayOrder.
 - questionCode values across the whole response are exactly Q1..Q{total_blocks}
   with no duplicates and no gaps.

@@ -5,8 +5,8 @@ from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field
 
 from app.schemas.common import Difficulty, QuestionType
 
-# MTF: one block per (type, difficulty) row, holding N pairs under a shared
-# `instruction`. Upper bound aligns with QuestionTypeSpec.numberOfQuestions ≤ 50.
+# MTF: one top-level block for all MTF payload rows; each row becomes a section
+# (difficulty + matchPairs) under a single shared `instruction`.
 MTF_MAX_MATCH_PAIRS = 50
 
 
@@ -104,9 +104,8 @@ class MatchPair(BaseModel):
     displayOrder: int
 
 
-class MTFInnerQuestion(BaseModel):
-    questionCode: str
-    displayOrder: int
+class MTFSection(BaseModel):
+    difficulty: Difficulty
     matchPairs: list[MatchPair] = Field(min_length=1, max_length=MTF_MAX_MATCH_PAIRS)
 
 
@@ -150,22 +149,21 @@ class FIBQuestion(BaseModel):
 class MTFQuestion(BaseModel):
     """Match-the-following block.
 
-    One MTF block per (type, difficulty) row in the payload. The block carries a
-    shared `instruction` heading and one inner question holding all `matchPairs`
-    for that row. `numberOfQuestions` from the payload row equals
-    `questions[0].matchPairs` length.
+    All MTF rows in the generate payload are merged into one top-level block.
+    `instruction` is shown once; each payload row becomes one `sections[]` entry
+    with that row's `difficultyLevel` and `numberOfQuestions` pairs.
     """
 
     type: Literal["MTF"] = "MTF"
-    difficulty: Difficulty
+    questionCode: str
+    displayOrder: int
     instruction: str = Field(
-        default="Match the items in Column A with Column B.",
-        description="Shared heading shown above the table of pairs.",
+        default="Match the following",
+        description="Shared heading shown once above all MTF sections.",
     )
-    questions: list[MTFInnerQuestion] = Field(
+    sections: list[MTFSection] = Field(
         min_length=1,
-        max_length=1,
-        description="Exactly one inner question holding the N matchPairs for this MTF row.",
+        description="One section per MTF payload row, grouped by difficulty.",
     )
 
 

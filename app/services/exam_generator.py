@@ -86,6 +86,112 @@ def _count_non_strict_objects(node: Any) -> int:
     return count
 
 
+_GROUNDING_STOPWORDS = frozenset(
+    {
+        "about", "after", "also", "been", "being", "both", "each", "from", "have",
+        "into", "more", "most", "only", "other", "same", "some", "such", "than",
+        "that", "their", "them", "then", "there", "these", "they", "this", "those",
+        "very", "what", "when", "where", "which", "while", "with", "would", "your",
+    }
+)
+
+
+def _content_words(text: str) -> set[str]:
+    return {
+        w
+        for w in _normalize_text(text).split()
+        if len(w) >= 4 and w not in _GROUNDING_STOPWORDS
+    }
+
+
+def _extract_numbers(text: str) -> set[str]:
+    return set(re.findall(r"\d+\.?\d*", text))
+
+
+def _build_context_corpus(context_matches: list[dict]) -> tuple[set[str], set[str]]:
+    """Word and number sets from Pinecone chunk text used for grounding checks."""
+    corpus_parts: list[str] = []
+    for match in context_matches:
+        md = match.get("metadata") or {}
+        chunk_text = str(md.get("text") or "").strip()
+        if chunk_text:
+            corpus_parts.append(chunk_text)
+    corpus = "\n".join(corpus_parts)
+    return _content_words(corpus), _extract_numbers(corpus)
+
+
+def _is_grounded_field(text: str, corpus_words: set[str], corpus_numbers: set[str]) -> bool:
+    """Return True when generated text plausibly comes from the RAG context."""
+    value = text.strip()
+    if not value or value == "(missing)":
+        return True
+
+    for number in _extract_numbers(value):
+        # Ignore single-digit ordinals/labels; flag invented multi-digit facts.
+        if len(number) >= 2 and number not in corpus_numbers:
+            return False
+
+    words = _content_words(value)
+    if len(words) <= 2:
+        return True
+
+    overlap = len(words & corpus_words)
+    return overlap >= max(2, int(len(words) * 0.25))
+
+
+def _iter_question_text_fields(question: dict):
+    qtype = str(question.get("type") or "")
+    if qtype == "MTF":
+        yield str(question.get("instruction") or "")
+        for section in question.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            for pair in section.get("matchPairs") or []:
+                if isinstance(pair, dict):
+                    yield str(pair.get("leftText") or "")
+                    yield str(pair.get("rightText") or "")
+        return
+    if qtype == "MCQ":
+        yield str(question.get("text") or "")
+        for option in question.get("options") or []:
+            if isinstance(option, dict):
+                yield str(option.get("text") or "")
+        return
+    yield str(question.get("text") or "")
+    if qtype == "FIB":
+        for answer in question.get("answers") or []:
+            yield str(answer)
+    elif qtype == "DES":
+        yield str(question.get("modelAnswer") or "")
+
+
+def _question_label(question: dict) -> str:
+    code = str(question.get("questionCode") or "").strip()
+    if code:
+        return code
+    return str(question.get("type") or "question")
+
+
+def _find_ungrounded_questions(questions: list[dict], context_matches: list[dict]) -> list[str]:
+    if not context_matches:
+        return []
+    corpus_words, corpus_numbers = _build_context_corpus(context_matches)
+    if not corpus_words and not corpus_numbers:
+        return []
+
+    issues: list[str] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        label = _question_label(question)
+        for field_text in _iter_question_text_fields(question):
+            if not _is_grounded_field(field_text, corpus_words, corpus_numbers):
+                preview = field_text.strip().replace("\n", " ")[:100]
+                issues.append(f"{label}: not grounded in context — {preview!r}")
+                break
+    return issues
+
+
 def _infer_question_type(question: dict) -> str | None:
     if question.get("type"):
         return str(question["type"])
@@ -95,6 +201,8 @@ def _infer_question_type(question: dict) -> str | None:
         return "TOF"
     if isinstance(question.get("blanks"), list):
         return "FIB"
+    if isinstance(question.get("sections"), list):
+        return "MTF"
     if isinstance(question.get("matchPairs"), list):
         return "MTF"
     if "instruction" in question and isinstance(question.get("questions"), list):
@@ -234,97 +342,169 @@ def _looks_like_pair_label(value: str) -> bool:
     return False
 
 
-def _collect_mtf_raw_pairs(question: dict) -> list[dict]:
-    """Pull raw pair-shaped dicts out of any MTF representation the LLM might emit."""
-    raw: list[dict] = []
-    inner = question.get("questions")
-    if isinstance(inner, list):
-        for inner_q in inner:
-            if isinstance(inner_q, dict) and isinstance(inner_q.get("matchPairs"), list):
-                for p in inner_q["matchPairs"]:
-                    if isinstance(p, dict):
-                        raw.append(p)
-    if not raw and isinstance(question.get("matchPairs"), list):
-        for p in question["matchPairs"]:
-            if isinstance(p, dict):
-                raw.append(p)
-    if not raw:
-        left = question.get("leftColumn")
-        right = question.get("rightColumn")
-        if isinstance(left, list) and isinstance(right, list):
-            size = min(len(left), len(right))
-            for i in range(size):
-                raw.append({"leftText": str(left[i]), "rightText": str(right[i])})
-    return raw
+def _normalize_mtf_pair_dict(raw: dict, idx_one_based: int) -> dict:
+    left_text = str(raw.get("leftText") or raw.get("left") or "").strip()
+    right_text = str(raw.get("rightText") or raw.get("right") or "").strip()
+    if not right_text:
+        legacy_pk = str(raw.get("pairKey") or "").strip()
+        if legacy_pk and not _looks_like_pair_label(legacy_pk):
+            right_text = legacy_pk
+    return {
+        "pairKey": _mtf_pair_label(idx_one_based),
+        "leftText": left_text,
+        "rightText": right_text,
+        "displayOrder": idx_one_based,
+    }
 
 
-def _normalize_mtf_block(question: dict, default_difficulty: str) -> None:
-    """Restructure an MTF entry to the schema: {type, difficulty, instruction, questions[]}.
+def _dedupe_mtf_pair_pool(pool: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for p in pool:
+        lt = str(p.get("leftText") or p.get("left") or "").strip()
+        rt = str(p.get("rightText") or p.get("right") or "").strip()
+        if not lt and not rt:
+            continue
+        key = (lt.lower(), rt.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"leftText": lt, "rightText": rt})
+    return out
 
-    Server-side responsibilities:
-      - Derive a shared `instruction` heading (fall back to `text`/`heading`/`title`).
-      - Build one inner question whose `matchPairs` holds all collected pairs.
-      - Overwrite `pairKey` with server-assigned A, B, C, ... by displayOrder.
-      - Migrate legacy pairs where `pairKey` was the right-side answer to `rightText`.
-    """
-    instruction_raw = (
-        question.get("instruction")
-        or question.get("text")
-        or question.get("heading")
-        or question.get("title")
-        or ""
-    )
-    instruction = str(instruction_raw).strip() or "Match the items in Column A with Column B."
 
-    raw_pairs = _collect_mtf_raw_pairs(question)
+def _pool_mtf_pairs_from_emitted(mtf_blocks: list[dict]) -> tuple[dict[str, list[dict]], str]:
+    """Collect pairs grouped by difficulty from any MTF shape the LLM may emit."""
+    pool_by_diff: dict[str, list[dict]] = {}
+    instruction = ""
 
-    normalized_pairs: list[dict] = []
-    for idx, p in enumerate(raw_pairs, start=1):
-        left_text = str(p.get("leftText") or p.get("left") or "").strip()
-        right_text = str(p.get("rightText") or p.get("right") or "").strip()
-        if not right_text:
-            legacy_pk = str(p.get("pairKey") or "").strip()
-            # Legacy shape used `pairKey` as the actual right-side answer text.
-            if legacy_pk and not _looks_like_pair_label(legacy_pk):
-                right_text = legacy_pk
-        normalized_pairs.append(
-            {
-                "pairKey": _mtf_pair_label(idx),
-                "leftText": left_text,
-                "rightText": right_text,
-                "displayOrder": idx,
-            }
+    for block in mtf_blocks:
+        inst = str(block.get("instruction") or block.get("heading") or block.get("title") or "").strip()
+        if inst and not instruction:
+            instruction = inst
+
+        block_diff = _normalize_difficulty(
+            block.get("difficulty") or block.get("difficultyLevel"), "EASY"
         )
 
-    if not normalized_pairs:
-        normalized_pairs = [
-            {"pairKey": "A", "leftText": "", "rightText": "", "displayOrder": 1}
-        ]
+        sections = block.get("sections")
+        if isinstance(sections, list) and sections:
+            for sec in sections:
+                if not isinstance(sec, dict):
+                    continue
+                diff = _normalize_difficulty(sec.get("difficulty") or block_diff, block_diff)
+                pool_by_diff.setdefault(diff, [])
+                for p in sec.get("matchPairs") or []:
+                    if isinstance(p, dict):
+                        pool_by_diff[diff].append(p)
+            continue
 
-    inner_q_code = ""
-    inner_display_order = 0
-    inner_list = question.get("questions")
-    if isinstance(inner_list, list) and inner_list and isinstance(inner_list[0], dict):
-        inner_q_code = str(inner_list[0].get("questionCode") or "").strip()
-        inner_display_order = int(inner_list[0].get("displayOrder") or 0)
-    inner_q_code = inner_q_code or str(question.get("questionCode") or "").strip()
-    inner_display_order = inner_display_order or int(question.get("displayOrder") or 1)
+        inner = block.get("questions")
+        if isinstance(inner, list):
+            for inner_q in inner:
+                if isinstance(inner_q, dict) and isinstance(inner_q.get("matchPairs"), list):
+                    diff = _normalize_difficulty(
+                        inner_q.get("difficulty") or block_diff, block_diff
+                    )
+                    pool_by_diff.setdefault(diff, [])
+                    for p in inner_q["matchPairs"]:
+                        if isinstance(p, dict):
+                            pool_by_diff[diff].append(p)
+            if pool_by_diff:
+                continue
 
-    difficulty = _normalize_difficulty(
-        question.get("difficulty") or question.get("difficultyLevel"), default_difficulty
-    )
+        if isinstance(block.get("matchPairs"), list):
+            pool_by_diff.setdefault(block_diff, [])
+            for p in block["matchPairs"]:
+                if isinstance(p, dict):
+                    pool_by_diff[block_diff].append(p)
+            continue
 
-    question.clear()
-    question["type"] = "MTF"
-    question["difficulty"] = difficulty
-    question["instruction"] = instruction
-    question["questions"] = [
-        {
-            "questionCode": inner_q_code or "Q?",
-            "displayOrder": inner_display_order,
-            "matchPairs": normalized_pairs,
-        }
+        left = block.get("leftColumn")
+        right = block.get("rightColumn")
+        if isinstance(left, list) and isinstance(right, list):
+            pool_by_diff.setdefault(block_diff, [])
+            size = min(len(left), len(right))
+            for i in range(size):
+                pool_by_diff[block_diff].append(
+                    {"leftText": str(left[i]), "rightText": str(right[i])}
+                )
+
+    if not instruction:
+        instruction = "Match the following"
+    return pool_by_diff, instruction
+
+
+def _merge_mtf_into_single_block(
+    normalized_questions: list[dict], payload: ExamPayload
+) -> list[dict]:
+    """Merge all MTF payload rows into one top-level MTF block with `sections[]`.
+
+    Each MTF row in the payload becomes one section (difficulty + matchPairs).
+    `instruction` is set once on the outer block; sections carry pairs only.
+    """
+    mtf_rows: list[tuple[str, int]] = [
+        (spec.difficultyLevel.value, spec.numberOfQuestions)
+        for spec in payload.questionTypes
+        if spec.type.value == "MTF"
     ]
+    if not mtf_rows:
+        kept = [q for q in normalized_questions if q.get("type") != "MTF"]
+        if len(kept) != len(normalized_questions):
+            logger.info(
+                "MTF merge: dropped %d unexpected MTF blocks (payload has no MTF rows)",
+                len(normalized_questions) - len(kept),
+            )
+        return kept
+
+    mtf_emitted = [q for q in normalized_questions if q.get("type") == "MTF"]
+    pool_by_diff, instruction = _pool_mtf_pairs_from_emitted(mtf_emitted)
+
+    deduped_pools: dict[str, list[dict]] = {
+        diff: _dedupe_mtf_pair_pool(pool) for diff, pool in pool_by_diff.items()
+    }
+
+    sections: list[dict] = []
+    consumed_by_diff: dict[str, int] = {}
+    for diff, n in mtf_rows:
+        cursor = consumed_by_diff.get(diff, 0)
+        pool = deduped_pools.get(diff, [])
+        slice_pairs = list(pool[cursor : cursor + n])
+        while len(slice_pairs) < n:
+            slice_pairs.append({"leftText": "", "rightText": ""})
+        consumed_by_diff[diff] = cursor + len(slice_pairs)
+        normalized_pairs = [
+            _normalize_mtf_pair_dict(p, i + 1) for i, p in enumerate(slice_pairs)
+        ]
+        sections.append({"difficulty": diff, "matchPairs": normalized_pairs})
+
+    single_block: dict = {
+        "type": "MTF",
+        "questionCode": "Q?",
+        "displayOrder": 0,
+        "instruction": instruction,
+        "sections": sections,
+    }
+
+    rebuilt: list[dict] = []
+    mtf_inserted = False
+    for q in normalized_questions:
+        if q.get("type") == "MTF":
+            if not mtf_inserted:
+                rebuilt.append(single_block)
+                mtf_inserted = True
+            continue
+        rebuilt.append(q)
+    if not mtf_inserted:
+        rebuilt.append(single_block)
+
+    if len(mtf_emitted) != 1:
+        logger.info(
+            "MTF merge: collapsed %d LLM MTF block(s) into 1 (sections=%d)",
+            len(mtf_emitted),
+            len(sections),
+        )
+    return rebuilt
 
 
 def _normalize_fib_answers(question: dict) -> None:
@@ -448,7 +628,7 @@ def _enforce_non_mtf_counts(
       - Pads any short bucket with a placeholder of the correct type/difficulty.
 
     MTF blocks pass through untouched here — they are governed by
-    `_enforce_mtf_row_to_block` upstream.
+    `_merge_mtf_into_single_block` upstream.
     """
     expected: dict[tuple[str, str], int] = {}
     for spec in payload.questionTypes:
@@ -507,150 +687,6 @@ def _enforce_non_mtf_counts(
     return rebuilt
 
 
-def _enforce_mtf_row_to_block(
-    normalized_questions: list[dict], payload: ExamPayload
-) -> list[dict]:
-    """Enforce: 1 MTF block per MTF row in payload, each block holds exactly N pairs.
-
-    LLMs often emit one MTF block per requested "question" (N blocks of N pairs each)
-    even though the contract is "1 block whose `matchPairs` has length N". This pass
-    fixes that drift server-side:
-
-      - Pool all pair-shaped dicts from MTF blocks the LLM emitted, grouped by
-        difficulty, deduped by (leftText, rightText).
-      - For each MTF row in payload (in payload order), draw exactly that row's
-        `numberOfQuestions` pairs from the matching difficulty's pool. Multiple
-        MTF rows of the same difficulty consume the pool sequentially.
-      - Re-stamp pairKey labels (A, B, C, ...) and displayOrder.
-      - Excess MTF blocks the LLM produced are dropped. Missing pairs are padded
-        with empty placeholders so the schema still validates.
-
-    Non-MTF questions are passed through untouched. Relative position of MTF vs
-    non-MTF blocks is preserved as best as possible (first MTF-position per
-    difficulty receives the rebuilt block).
-    """
-    mtf_rows: list[tuple[str, int]] = [
-        (spec.difficultyLevel.value, spec.numberOfQuestions)
-        for spec in payload.questionTypes
-        if spec.type.value == "MTF"
-    ]
-    if not mtf_rows:
-        # No MTF expected; drop any MTF blocks the LLM emitted.
-        kept = [q for q in normalized_questions if q.get("type") != "MTF"]
-        if len(kept) != len(normalized_questions):
-            logger.info(
-                "MTF enforcement: dropped %d unexpected MTF blocks (payload has no MTF rows)",
-                len(normalized_questions) - len(kept),
-            )
-        return kept
-
-    pool_by_diff: dict[str, list[dict]] = {}
-    instruction_by_diff: dict[str, str] = {}
-    mtf_block_count = 0
-    for q in normalized_questions:
-        if q.get("type") != "MTF":
-            continue
-        mtf_block_count += 1
-        diff = str(q.get("difficulty") or "")
-        pool_by_diff.setdefault(diff, [])
-        inst = str(q.get("instruction") or "").strip()
-        if inst and diff not in instruction_by_diff:
-            instruction_by_diff[diff] = inst
-        for inner_q in q.get("questions") or []:
-            if isinstance(inner_q, dict):
-                for p in inner_q.get("matchPairs") or []:
-                    if isinstance(p, dict):
-                        pool_by_diff[diff].append(p)
-
-    # Dedupe each pool by (leftText, rightText), preserve order.
-    deduped_pools: dict[str, list[dict]] = {}
-    for diff, pool in pool_by_diff.items():
-        seen: set[tuple[str, str]] = set()
-        out: list[dict] = []
-        for p in pool:
-            lt = str(p.get("leftText") or "").strip()
-            rt = str(p.get("rightText") or "").strip()
-            if not lt and not rt:
-                continue
-            key = (lt.lower(), rt.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({"leftText": lt, "rightText": rt})
-        deduped_pools[diff] = out
-
-    # Build one expected block per MTF row in payload order.
-    expected_blocks: list[dict] = []
-    consumed_by_diff: dict[str, int] = {}
-    for diff, n in mtf_rows:
-        cursor = consumed_by_diff.get(diff, 0)
-        pool = deduped_pools.get(diff, [])
-        slice_pairs = list(pool[cursor : cursor + n])
-        while len(slice_pairs) < n:
-            slice_pairs.append({"leftText": "", "rightText": ""})
-        consumed_by_diff[diff] = cursor + len(slice_pairs)
-        normalized_pairs = [
-            {
-                "pairKey": _mtf_pair_label(i + 1),
-                "leftText": str(p.get("leftText") or "").strip(),
-                "rightText": str(p.get("rightText") or "").strip(),
-                "displayOrder": i + 1,
-            }
-            for i, p in enumerate(slice_pairs)
-        ]
-        expected_blocks.append(
-            {
-                "type": "MTF",
-                "difficulty": diff,
-                "instruction": instruction_by_diff.get(
-                    diff, "Match the items in Column A with Column B."
-                ),
-                "questions": [
-                    {
-                        # Global Q-code/displayOrder are stamped by the caller after this pass.
-                        "questionCode": "Q?",
-                        "displayOrder": 0,
-                        "matchPairs": normalized_pairs,
-                    }
-                ],
-            }
-        )
-
-    # Index expected blocks by difficulty for in-order placement.
-    expected_by_diff: dict[str, list[dict]] = {}
-    for blk in expected_blocks:
-        expected_by_diff.setdefault(str(blk["difficulty"]), []).append(blk)
-
-    rebuilt: list[dict] = []
-    placed_by_diff: dict[str, int] = {}
-    for q in normalized_questions:
-        if q.get("type") != "MTF":
-            rebuilt.append(q)
-            continue
-        diff = str(q.get("difficulty") or "")
-        bucket = expected_by_diff.get(diff, [])
-        used = placed_by_diff.get(diff, 0)
-        if used < len(bucket):
-            rebuilt.append(bucket[used])
-            placed_by_diff[diff] = used + 1
-        # Else: excess MTF block of this difficulty -> drop.
-
-    # Any expected blocks not yet placed (LLM produced fewer MTF blocks of that
-    # difficulty than payload required) get appended at the end.
-    for diff, bucket in expected_by_diff.items():
-        used = placed_by_diff.get(diff, 0)
-        for blk in bucket[used:]:
-            rebuilt.append(blk)
-
-    if mtf_block_count != len(mtf_rows):
-        logger.info(
-            "MTF enforcement: collapsed %d LLM MTF blocks into %d (one per payload MTF row)",
-            mtf_block_count,
-            len(mtf_rows),
-        )
-    return rebuilt
-
-
 def _repair_generated_exam_data(data: dict, payload: ExamPayload, context_matches: list[dict]) -> dict:
     repaired = dict(data)
     raw_questions = repaired.get("questions")
@@ -667,10 +703,6 @@ def _repair_generated_exam_data(data: dict, payload: ExamPayload, context_matche
             q["type"] = q_type
         q.pop("sources", None)
         if q.get("type") == "MTF":
-            # MTF lives in its own nested shape: {type, difficulty, instruction, questions[]}.
-            # Top-level `questionCode` / `text` / `displayOrder` do not exist on MTF blocks;
-            # they live on the inner question and are stamped in the global Q-code pass below.
-            _normalize_mtf_block(q, default_difficulty)
             normalized_questions.append(q)
             continue
         q["questionCode"] = str(q.get("questionCode") or f"Q{idx}")
@@ -688,31 +720,19 @@ def _repair_generated_exam_data(data: dict, payload: ExamPayload, context_matche
             _normalize_des_for_response(q)
         normalized_questions.append(q)
 
-    # Enforce "1 MTF block per MTF row in payload, each block has exactly N pairs".
-    # This is the safety net for when the LLM emits N separate MTF blocks despite
-    # the prompt telling it to emit one block with N pairs.
-    normalized_questions = _enforce_mtf_row_to_block(normalized_questions, payload)
+    normalized_questions = _merge_mtf_into_single_block(normalized_questions, payload)
 
     # Enforce non-MTF per-row counts: drop unrequested (type, difficulty) buckets,
     # trim over-count buckets, pad short buckets. Mirrors the MTF enforcement so
     # the response shape always matches the payload contract exactly.
     normalized_questions = _enforce_non_mtf_counts(normalized_questions, payload)
 
-    # Single global Q1..Qn sequence over top-level blocks. For MTF the code lives
-    # on the inner question; for everything else it lives at the top.
+    # Single global Q1..Qn sequence over top-level blocks (MTF counts as one block).
     seq = 1
     for q in normalized_questions:
-        if q.get("type") == "MTF":
-            inner_list = q.get("questions") or []
-            for inner_q in inner_list:
-                if isinstance(inner_q, dict):
-                    inner_q["questionCode"] = f"Q{seq}"
-                    inner_q["displayOrder"] = seq
-                    seq += 1
-        else:
-            q["questionCode"] = f"Q{seq}"
-            q["displayOrder"] = seq
-            seq += 1
+        q["questionCode"] = f"Q{seq}"
+        q["displayOrder"] = seq
+        seq += 1
     repaired["questions"] = normalized_questions
     repaired.pop("sources", None)
     base = str(payload.description or "").strip()
@@ -1038,6 +1058,22 @@ def generate_exam(payload: ExamPayload, openai_client: OpenAI, pinecone_client: 
             content = completion.choices[0].message.content or "{}"
             data = json.loads(content)
             data = _repair_generated_exam_data(data, payload, context_matches)
+            grounding_issues = _find_ungrounded_questions(data.get("questions") or [], context_matches)
+            if grounding_issues:
+                logger.warning(
+                    "Grounding check failed attempt=%d issues=%d sample=%s",
+                    attempt + 1,
+                    len(grounding_issues),
+                    grounding_issues[0] if grounding_issues else "",
+                )
+                if attempt == 0:
+                    prompt += (
+                        "\n\nPrevious output contained content not grounded in the Context chunks:\n"
+                        + "\n".join(f"- {issue}" for issue in grounding_issues[:12])
+                        + "\n\nRegenerate ALL questions using ONLY facts, terms, names, and numbers "
+                        "that appear in the Context chunks above. Do not invent or assume content."
+                    )
+                    continue
             data["generated_at"] = data.get("generated_at") or datetime.now(timezone.utc).isoformat()
             data["class"] = class_str
             data["subject"] = subject_str
