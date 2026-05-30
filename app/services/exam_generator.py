@@ -120,6 +120,183 @@ def _build_context_corpus(context_matches: list[dict]) -> tuple[set[str], set[st
     return _content_words(corpus), _extract_numbers(corpus)
 
 
+_FALLBACK_SNIPPET = "Refer to the chapter material covered in class."
+
+
+def _extract_context_texts(context_matches: list[dict]) -> list[str]:
+    texts: list[str] = []
+    for match in context_matches:
+        md = match.get("metadata") or {}
+        chunk_text = str(md.get("text") or "").strip()
+        if chunk_text:
+            texts.append(chunk_text)
+    return texts
+
+
+def _context_snippets(context_matches: list[dict], max_len: int = 280) -> list[str]:
+    """Question-sized lines derived from RAG chunks (used when the model leaves fields blank)."""
+    snippets: list[str] = []
+    for text in _extract_context_texts(context_matches):
+        for part in re.split(r"(?<=[.!?])\s+", text):
+            part = part.strip()
+            if len(part) >= 24:
+                snippets.append(part[:max_len])
+        if not snippets or len(text) >= 24:
+            compact = " ".join(text.split())
+            if len(compact) >= 24:
+                snippets.append(compact[:max_len])
+    if not snippets:
+        return [_FALLBACK_SNIPPET]
+    return snippets
+
+
+def _snippet_at(snippets: list[str], index: int) -> str:
+    return snippets[index % len(snippets)]
+
+
+def _is_missing_text(value: Any) -> bool:
+    s = str(value or "").strip()
+    return not s or s == "(missing)"
+
+
+def _mcq_options_empty(question: dict) -> bool:
+    opts = question.get("options")
+    if not isinstance(opts, list) or not opts:
+        return True
+    return all(_is_missing_text(o.get("text") if isinstance(o, dict) else o) for o in opts)
+
+
+def _question_has_empty_content(question: dict) -> bool:
+    qtype = str(question.get("type") or "")
+    if qtype == "MTF":
+        if _is_missing_text(question.get("instruction")):
+            return True
+        for section in question.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            for pair in section.get("matchPairs") or []:
+                if not isinstance(pair, dict):
+                    continue
+                if _is_missing_text(pair.get("leftText")) and _is_missing_text(pair.get("rightText")):
+                    return True
+        return False
+    if qtype == "MCQ":
+        return _is_missing_text(question.get("text")) or _mcq_options_empty(question)
+    if qtype in {"TOF", "FIB", "DES"}:
+        return _is_missing_text(question.get("text"))
+    return _is_missing_text(question.get("text"))
+
+
+def _find_empty_question_issues(questions: list[dict]) -> list[str]:
+    issues: list[str] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        if _question_has_empty_content(question):
+            issues.append(f"{_question_label(question)}: empty question content")
+    return issues
+
+
+def _fill_mcq_from_snippet(question: dict, snippet: str, opt_b: str) -> None:
+    question["text"] = f"Which statement is supported by the lesson material?\n{snippet}"
+    question["options"] = [
+        {"optionLabel": "A", "text": snippet[:240], "displayOrder": 1},
+        {"optionLabel": "B", "text": opt_b[:240], "displayOrder": 2},
+    ]
+    question["correctOption"] = "A"
+
+
+def _fill_fib_from_snippet(question: dict, snippet: str) -> None:
+    words = snippet.split()
+    if len(words) >= 5:
+        answer = words[len(words) // 2]
+        blanked = words[: len(words) // 2] + ["_____"] + words[len(words) // 2 + 1 :]
+        question["text"] = " ".join(blanked)
+        question["answers"] = [answer]
+    else:
+        question["text"] = f"Complete: {snippet} _____"
+        question["answers"] = ["answer"]
+
+
+def _fill_single_question_from_context(question: dict, snippets: list[str], index: int) -> int:
+    qtype = str(question.get("type") or "")
+    if not _question_has_empty_content(question):
+        return index
+    primary = _snippet_at(snippets, index)
+    secondary = _snippet_at(snippets, index + 1)
+    index += 1
+    if qtype == "MCQ":
+        if _is_missing_text(question.get("text")):
+            _fill_mcq_from_snippet(question, primary, secondary)
+        elif _mcq_options_empty(question):
+            _fill_mcq_from_snippet(question, primary, secondary)
+        else:
+            for i, opt in enumerate(question.get("options") or []):
+                if isinstance(opt, dict) and _is_missing_text(opt.get("text")):
+                    opt["text"] = _snippet_at(snippets, index + i)[:240]
+            _normalize_mcq_correct_option(question)
+    elif qtype == "TOF":
+        question["text"] = primary
+        question.setdefault("answer", True)
+    elif qtype == "FIB":
+        _fill_fib_from_snippet(question, primary)
+        _normalize_fib_answers(question)
+    elif qtype == "DES":
+        question["text"] = f"Explain the following based on the chapter:\n{primary[:220]}"
+        if _is_missing_text(question.get("modelAnswer")):
+            question["modelAnswer"] = primary
+    elif qtype == "MTF":
+        if _is_missing_text(question.get("instruction")):
+            question["instruction"] = "Match the following items from the lesson."
+        for section in question.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            for pair in section.get("matchPairs") or []:
+                if not isinstance(pair, dict):
+                    continue
+                if _is_missing_text(pair.get("leftText")) and _is_missing_text(pair.get("rightText")):
+                    pair["leftText"] = primary[:200]
+                    pair["rightText"] = secondary[:200]
+                    index += 1
+                    primary = _snippet_at(snippets, index)
+                    secondary = _snippet_at(snippets, index + 1)
+                elif _is_missing_text(pair.get("leftText")):
+                    pair["leftText"] = primary[:200]
+                elif _is_missing_text(pair.get("rightText")):
+                    pair["rightText"] = secondary[:200]
+    else:
+        question["text"] = primary
+    return index
+
+
+def _fill_empty_questions_from_context(
+    questions: list[dict], context_matches: list[dict]
+) -> int:
+    snippets = _context_snippets(context_matches)
+    cursor = 0
+    filled = 0
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        before = _question_has_empty_content(question)
+        cursor = _fill_single_question_from_context(question, snippets, cursor)
+        if before and not _question_has_empty_content(question):
+            filled += 1
+        elif before:
+            # Last resort so Pydantic/clients never see blank stems.
+            fallback = _snippet_at(snippets, cursor)
+            cursor += 1
+            if str(question.get("type") or "") == "MCQ":
+                _fill_mcq_from_snippet(question, fallback, _snippet_at(snippets, cursor))
+                cursor += 1
+            else:
+                question["text"] = fallback
+            filled += 1
+    if filled:
+        logger.info("Filled %d question(s) with context snippets (empty LLM fields)", filled)
+    return filled
+
+
 def _is_grounded_field(text: str, corpus_words: set[str], corpus_numbers: set[str]) -> bool:
     """Return True when generated text plausibly comes from the RAG context."""
     value = text.strip()
@@ -436,7 +613,9 @@ def _pool_mtf_pairs_from_emitted(mtf_blocks: list[dict]) -> tuple[dict[str, list
 
 
 def _merge_mtf_into_single_block(
-    normalized_questions: list[dict], payload: ExamPayload
+    normalized_questions: list[dict],
+    payload: ExamPayload,
+    context_matches: list[dict] | None = None,
 ) -> list[dict]:
     """Merge all MTF payload rows into one top-level MTF block with `sections[]`.
 
@@ -470,8 +649,13 @@ def _merge_mtf_into_single_block(
         cursor = consumed_by_diff.get(diff, 0)
         pool = deduped_pools.get(diff, [])
         slice_pairs = list(pool[cursor : cursor + n])
+        snippets = _context_snippets(context_matches) if context_matches else [_FALLBACK_SNIPPET]
+        pad_idx = cursor + len(slice_pairs)
         while len(slice_pairs) < n:
-            slice_pairs.append({"leftText": "", "rightText": ""})
+            left = _snippet_at(snippets, pad_idx)
+            right = _snippet_at(snippets, pad_idx + 1)
+            slice_pairs.append({"leftText": left, "rightText": right})
+            pad_idx += 2
         consumed_by_diff[diff] = cursor + len(slice_pairs)
         normalized_pairs = [
             _normalize_mtf_pair_dict(p, i + 1) for i, p in enumerate(slice_pairs)
@@ -585,36 +769,33 @@ def _normalize_difficulty(value: Any, fallback: str) -> str:
     return txt if txt in {"VERY_EASY", "EASY", "MEDIUM", "HARD", "VERY_HARD"} else fallback
 
 
-def _placeholder_non_mtf_question(qtype: str, difficulty: str) -> dict:
-    """Build a minimal valid placeholder for a non-MTF type. Used to pad short
-    buckets when the LLM produced fewer questions than the payload requested,
-    so the response still satisfies the per-row count contract.
-    """
+def _placeholder_non_mtf_question(
+    qtype: str, difficulty: str, snippet: str, opt_b: str
+) -> dict:
+    """Pad a short bucket with context-backed content (never blank stems)."""
     base: dict = {
         "type": qtype,
         "questionCode": "Q?",
         "displayOrder": 0,
         "difficulty": difficulty,
-        "text": "",
+        "text": snippet,
     }
     if qtype == "MCQ":
-        base["options"] = [
-            {"optionLabel": "A", "text": "", "displayOrder": 1},
-            {"optionLabel": "B", "text": "", "displayOrder": 2},
-        ]
-        base["correctOption"] = ""
+        _fill_mcq_from_snippet(base, snippet, opt_b)
     elif qtype == "TOF":
-        base["answer"] = False
+        base["answer"] = True
     elif qtype == "FIB":
-        base["answers"] = []
+        _fill_fib_from_snippet(base, snippet)
     elif qtype == "DES":
-        base["text"] = "(missing)"
-        base["modelAnswer"] = ""
+        base["text"] = f"Explain the following based on the chapter:\n{snippet[:220]}"
+        base["modelAnswer"] = snippet
     return base
 
 
 def _enforce_non_mtf_counts(
-    normalized_questions: list[dict], payload: ExamPayload
+    normalized_questions: list[dict],
+    payload: ExamPayload,
+    context_matches: list[dict] | None = None,
 ) -> list[dict]:
     """Enforce per-row counts for non-MTF question types.
 
@@ -669,12 +850,17 @@ def _enforce_non_mtf_counts(
         used[key] = seen + 1
         rebuilt.append(q)
 
+    snippets = _context_snippets(context_matches or [])
+    pad_cursor = sum(used.values())
     padded = 0
     for key, cap in expected.items():
         qtype, diff = key
         seen = used.get(key, 0)
         for _ in range(cap - seen):
-            rebuilt.append(_placeholder_non_mtf_question(qtype, diff))
+            primary = _snippet_at(snippets, pad_cursor)
+            secondary = _snippet_at(snippets, pad_cursor + 1)
+            pad_cursor += 2
+            rebuilt.append(_placeholder_non_mtf_question(qtype, diff, primary, secondary))
             padded += 1
 
     if dropped_unrequested or dropped_overflow or padded:
@@ -720,12 +906,16 @@ def _repair_generated_exam_data(data: dict, payload: ExamPayload, context_matche
             _normalize_des_for_response(q)
         normalized_questions.append(q)
 
-    normalized_questions = _merge_mtf_into_single_block(normalized_questions, payload)
+    normalized_questions = _merge_mtf_into_single_block(
+        normalized_questions, payload, context_matches
+    )
 
     # Enforce non-MTF per-row counts: drop unrequested (type, difficulty) buckets,
     # trim over-count buckets, pad short buckets. Mirrors the MTF enforcement so
     # the response shape always matches the payload contract exactly.
-    normalized_questions = _enforce_non_mtf_counts(normalized_questions, payload)
+    normalized_questions = _enforce_non_mtf_counts(
+        normalized_questions, payload, context_matches
+    )
 
     # Single global Q1..Qn sequence over top-level blocks (MTF counts as one block).
     seq = 1
@@ -733,6 +923,7 @@ def _repair_generated_exam_data(data: dict, payload: ExamPayload, context_matche
         q["questionCode"] = f"Q{seq}"
         q["displayOrder"] = seq
         seq += 1
+    _fill_empty_questions_from_context(normalized_questions, context_matches)
     repaired["questions"] = normalized_questions
     repaired.pop("sources", None)
     base = str(payload.description or "").strip()
@@ -1058,6 +1249,25 @@ def generate_exam(payload: ExamPayload, openai_client: OpenAI, pinecone_client: 
             content = completion.choices[0].message.content or "{}"
             data = json.loads(content)
             data = _repair_generated_exam_data(data, payload, context_matches)
+            empty_issues = _find_empty_question_issues(data.get("questions") or [])
+            if empty_issues:
+                logger.warning(
+                    "Empty question check failed attempt=%d issues=%d sample=%s",
+                    attempt + 1,
+                    len(empty_issues),
+                    empty_issues[0] if empty_issues else "",
+                )
+                if attempt == 0:
+                    prompt += (
+                        "\n\nPrevious output had empty question text, options, or match pairs:\n"
+                        + "\n".join(f"- {issue}" for issue in empty_issues[:12])
+                        + "\n\nRegenerate with non-empty `text`, MCQ `options[].text`, "
+                        "MTF `leftText`/`rightText`, and DES stems — all drawn from Context chunks."
+                    )
+                    continue
+                _fill_empty_questions_from_context(
+                    data.get("questions") or [], context_matches
+                )
             grounding_issues = _find_ungrounded_questions(data.get("questions") or [], context_matches)
             if grounding_issues:
                 logger.warning(

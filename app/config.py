@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,6 +25,18 @@ class Settings(BaseSettings):
     # an interval from inside the FastAPI lifespan. Leave blank to disable.
     keepalive_url: str | None = None
     keepalive_interval_seconds: int = 600
+
+
+def resolve_keepalive_url(settings: Settings) -> str:
+    """Explicit KEEPALIVE_URL, else platform public base URL + /health."""
+    explicit = (settings.keepalive_url or "").strip()
+    if explicit:
+        return explicit
+    for env_key in ("RENDER_EXTERNAL_URL", "PUBLIC_BASE_URL", "APP_URL"):
+        base = os.getenv(env_key, "").strip().rstrip("/")
+        if base:
+            return f"{base}/health"
+    return ""
 
 
 @lru_cache

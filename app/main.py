@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, resolve_keepalive_url
 from app.deps import build_openai_client, build_pinecone_client, ensure_pinecone_index
 from app.errors import AppError
 from app.routers.admin import router as admin_router
@@ -18,10 +18,9 @@ from app.routers.exam import router as exam_router
 from app.routers.ingest import router as ingest_router
 
 
-async def _keepalive_loop(settings: Settings) -> None:
-    # Hits settings.keepalive_url every settings.keepalive_interval_seconds.
+async def _keepalive_loop(settings: Settings, url: str) -> None:
+    # GET url every keepalive_interval_seconds (default 600 = 10 min).
     # NOTE: with `uvicorn --workers N`, each worker runs its own loop.
-    url = (settings.keepalive_url or "").strip()
     interval = max(5, int(settings.keepalive_interval_seconds))
     if not url:
         return
@@ -75,10 +74,11 @@ async def lifespan(app: FastAPI):
     app.state.pinecone = build_pinecone_client(settings)
     ensure_pinecone_index(settings, app.state.pinecone)
 
+    keepalive_url = resolve_keepalive_url(settings)
     keepalive_task: asyncio.Task | None = None
-    if (settings.keepalive_url or "").strip():
+    if keepalive_url:
         keepalive_task = asyncio.create_task(
-            _keepalive_loop(settings), name="keepalive"
+            _keepalive_loop(settings, keepalive_url), name="keepalive"
         )
 
     try:
