@@ -792,80 +792,87 @@ def _placeholder_non_mtf_question(
     return base
 
 
-def _enforce_non_mtf_counts(
+def _order_questions_by_payload(
     normalized_questions: list[dict],
     payload: ExamPayload,
     context_matches: list[dict] | None = None,
 ) -> list[dict]:
-    """Enforce per-row counts for non-MTF question types.
+    """Reorder top-level `questions[]` to match `questionTypes[]` payload order.
 
-    For each non-MTF row in the payload, the response must contain exactly
-    `numberOfQuestions` top-level questions whose `type` AND `difficulty` match.
-    LLMs frequently invent question types/difficulties not requested (e.g. user
-    asked MTF-only and the LLM also returned a FIB and a TOF). This pass:
-
-      - Drops any non-MTF question whose `(type, difficulty)` is not in the payload.
-      - Trims any bucket that has more entries than the payload requested.
-      - Pads any short bucket with a placeholder of the correct type/difficulty.
-
-    MTF blocks pass through untouched here — they are governed by
-    `_merge_mtf_into_single_block` upstream.
+    Walk payload rows sequentially. For each non-MTF row, emit exactly
+    `numberOfQuestions` consecutive blocks with matching `(type, difficulty)`.
+    Insert the single merged MTF block at the position of the first MTF row.
+    Drop unrequested types, trim overflow buckets, and pad short buckets.
     """
-    expected: dict[tuple[str, str], int] = {}
+    default_difficulty = payload.questionTypes[0].difficultyLevel.value if payload.questionTypes else "EASY"
+    expected_total: dict[tuple[str, str], int] = {}
     for spec in payload.questionTypes:
         if spec.type.value == "MTF":
             continue
         key = (spec.type.value, spec.difficultyLevel.value)
-        expected[key] = expected.get(key, 0) + spec.numberOfQuestions
+        expected_total[key] = expected_total.get(key, 0) + spec.numberOfQuestions
 
-    if not expected:
-        kept = [q for q in normalized_questions if q.get("type") == "MTF"]
-        dropped = len(normalized_questions) - len(kept)
-        if dropped:
-            logger.info(
-                "Non-MTF enforcement: dropped %d non-MTF blocks (payload has no non-MTF rows)",
-                dropped,
-            )
-        return kept
+    mtf_blocks = [q for q in normalized_questions if q.get("type") == "MTF"]
+    mtf_block = mtf_blocks[0] if mtf_blocks else None
+    if len(mtf_blocks) > 1:
+        logger.info(
+            "Payload ordering: using first of %d MTF blocks (expected 1 after merge)",
+            len(mtf_blocks),
+        )
 
-    used: dict[tuple[str, str], int] = {}
-    rebuilt: list[dict] = []
+    pools: dict[tuple[str, str], list[dict]] = {}
     dropped_unrequested = 0
     dropped_overflow = 0
     for q in normalized_questions:
-        t = str(q.get("type") or "")
-        if t == "MTF":
-            rebuilt.append(q)
+        if q.get("type") == "MTF":
             continue
-        diff = str(q.get("difficulty") or "").strip().upper()
+        t = str(q.get("type") or "")
+        diff = _normalize_difficulty(q.get("difficulty") or q.get("difficultyLevel"), default_difficulty)
         key = (t, diff)
-        cap = expected.get(key, 0)
+        cap = expected_total.get(key, 0)
         if cap <= 0:
             dropped_unrequested += 1
             continue
-        seen = used.get(key, 0)
-        if seen >= cap:
+        bucket = pools.setdefault(key, [])
+        if len(bucket) >= cap:
             dropped_overflow += 1
             continue
-        used[key] = seen + 1
-        rebuilt.append(q)
+        bucket.append(q)
 
     snippets = _context_snippets(context_matches or [])
-    pad_cursor = sum(used.values())
+    pad_cursor = sum(len(v) for v in pools.values())
     padded = 0
-    for key, cap in expected.items():
-        qtype, diff = key
-        seen = used.get(key, 0)
-        for _ in range(cap - seen):
+    rebuilt: list[dict] = []
+    mtf_inserted = False
+
+    for spec in payload.questionTypes:
+        if spec.type.value == "MTF":
+            if not mtf_inserted:
+                if mtf_block is not None:
+                    rebuilt.append(mtf_block)
+                mtf_inserted = True
+            continue
+
+        key = (spec.type.value, spec.difficultyLevel.value)
+        bucket = pools.get(key, [])
+        for _ in range(spec.numberOfQuestions):
+            if bucket:
+                rebuilt.append(bucket.pop(0))
+                continue
             primary = _snippet_at(snippets, pad_cursor)
             secondary = _snippet_at(snippets, pad_cursor + 1)
             pad_cursor += 2
-            rebuilt.append(_placeholder_non_mtf_question(qtype, diff, primary, secondary))
+            rebuilt.append(
+                _placeholder_non_mtf_question(spec.type.value, spec.difficultyLevel.value, primary, secondary)
+            )
             padded += 1
+
+    if not expected_total and not mtf_inserted and mtf_block is not None:
+        rebuilt.append(mtf_block)
 
     if dropped_unrequested or dropped_overflow or padded:
         logger.info(
-            "Non-MTF enforcement: dropped_unrequested=%d dropped_overflow=%d padded=%d",
+            "Payload ordering: dropped_unrequested=%d dropped_overflow=%d padded=%d",
             dropped_unrequested,
             dropped_overflow,
             padded,
@@ -910,10 +917,9 @@ def _repair_generated_exam_data(data: dict, payload: ExamPayload, context_matche
         normalized_questions, payload, context_matches
     )
 
-    # Enforce non-MTF per-row counts: drop unrequested (type, difficulty) buckets,
-    # trim over-count buckets, pad short buckets. Mirrors the MTF enforcement so
-    # the response shape always matches the payload contract exactly.
-    normalized_questions = _enforce_non_mtf_counts(
+    # Reorder to payload row sequence; drop unrequested buckets, trim overflow,
+    # pad short buckets. MTF block is inserted at the first MTF row position.
+    normalized_questions = _order_questions_by_payload(
         normalized_questions, payload, context_matches
     )
 

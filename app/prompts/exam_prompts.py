@@ -118,6 +118,29 @@ Exact question count (HARD CONSTRAINT — NO HALLUCINATION):
   Q{total_blocks}. No duplicates, no gaps. The MTF block gets one questionCode
   like any other top-level question.
 
+Question order (HARD CONSTRAINT — MUST MATCH PAYLOAD):
+- Emit top-level `questions[]` in EXACT `questionTypes[]` payload order.
+- Process each payload row sequentially from Row 1 to Row N.
+- For each non-MTF row: emit EXACTLY that row's `numberOfQuestions` consecutive
+  top-level questions with matching `type` and `difficultyLevel` BEFORE moving
+  to the next row.
+- For MTF rows: emit ONE top-level MTF block at the position of the FIRST MTF
+  row in the payload. All MTF rows become `sections[]` inside that single block,
+  in payload order.
+- `displayOrder` and `questionCode` must follow this final sequence:
+  Q1..Q{total_blocks} left-to-right in `questions[]`.
+- Do NOT group all MCQs together unless the payload lists MCQ rows first.
+- Do NOT sort by type or difficulty unless the payload is already in that order.
+
+WORKED EXAMPLE — payload:
+  Row 1: MCQ EASY ×2
+  Row 2: TOF MEDIUM ×1
+  Row 3: FIB EASY ×1
+CORRECT top-level order:
+  [ MCQ(EASY), MCQ(EASY), TOF(MEDIUM), FIB(EASY) ]
+WRONG:
+  [ TOF(MEDIUM), MCQ(EASY), FIB(EASY), MCQ(EASY) ]
+
 Rules:
 - Respect exact numberOfQuestions per type and difficulty (each questionTypes row: 1–50 questions).
 - Ensure final JSON matches schema exactly.
@@ -206,6 +229,8 @@ Final self-check before emitting JSON:
   Every matchPair has exactly: pairKey, leftText, rightText, displayOrder.
 - questionCode values across the whole response are exactly Q1..Q{total_blocks}
   with no duplicates and no gaps.
+- Top-level `questions[]` order matches `questionTypes[]` payload row order
+  (each non-MTF row's blocks are consecutive; one MTF block at the first MTF row).
 - Every cited `book_id`, `chapter`, `page` appears in the Context chunks.
 If any check fails, fix the output before returning. Return strictly valid JSON only.
 """

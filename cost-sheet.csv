@@ -1,0 +1,40 @@
+Category,Item,Model,Input_USD_per_1M,Output_USD_per_1M,Input_Tokens,Output_Tokens,Cost_USD,Notes
+Embedding,PDF Upload (30 pages),text-embedding-3-small,0.02,N/A,24000,N/A,0.0005,~30 chunks x 800 tokens
+Embedding,PDF Upload (125 pages),text-embedding-3-small,0.02,N/A,100000,N/A,0.002,~125 chunks
+Embedding,PDF Upload (625 pages),text-embedding-3-small,0.02,N/A,500000,N/A,0.01,Large chapter PDF
+Exam,5 questions (1 per type),gpt-4o-mini,0.15,0.60,11000,3500,0.0038,Current default chat model
+Exam,5 questions (1 per type),gpt-4.1-nano,0.10,0.40,11000,3500,0.0025,Cheapest chat model
+Exam,5 questions (1 per type),gpt-5-mini,0.25,2.00,11000,3500,0.0098,Better quality moderate cost
+Exam,5 questions (1 per type),gpt-4.1-mini,0.40,1.60,11000,3500,0.0100,Mid-tier
+Exam,5 questions (1 per type),gpt-4o,2.50,10.00,11000,3500,0.0625,Avoid for cost-sensitive use
+Exam,25 questions (full sheet),gpt-4o-mini,0.15,0.60,12000,15000,0.011,5 types x 5 difficulties
+Exam,25 questions (full sheet),gpt-4.1-nano,0.10,0.40,12000,15000,0.007,5 types x 5 difficulties
+Exam,25 questions (full sheet),gpt-5-mini,0.25,2.00,12000,15000,0.033,5 types x 5 difficulties
+Exam,25 questions (full sheet),gpt-4.1-mini,0.40,1.60,12000,15000,0.029,5 types x 5 difficulties
+Exam,25 questions (full sheet),gpt-4o,2.50,10.00,12000,15000,0.180,5 types x 5 difficulties
+Total,Small PDF + 5-question exam,gpt-4o-mini,N/A,N/A,N/A,N/A,0.004,Upload 0.0005 + Exam 0.0038
+Total,Small PDF + 5-question exam,gpt-4.1-nano,N/A,N/A,N/A,N/A,0.003,Upload 0.0005 + Exam 0.0025
+Total,Small PDF + 5-question exam,gpt-5-mini,N/A,N/A,N/A,N/A,0.010,Upload 0.0005 + Exam 0.0098
+Total,Small PDF + 5-question exam,gpt-4.1-mini,N/A,N/A,N/A,N/A,0.011,Upload 0.0005 + Exam 0.0100
+Total,Small PDF + 5-question exam,gpt-4o,N/A,N/A,N/A,N/A,0.063,Upload 0.0005 + Exam 0.0625
+Total,Large PDF + full sheet exam,gpt-4o-mini,N/A,N/A,N/A,N/A,0.021,Upload 0.01 + Exam 0.011
+Total,Large PDF + full sheet exam,gpt-4.1-nano,N/A,N/A,N/A,N/A,0.017,Upload 0.01 + Exam 0.007
+Total,Large PDF + full sheet exam,gpt-5-mini,N/A,N/A,N/A,N/A,0.043,Upload 0.01 + Exam 0.033
+Total,Large PDF + full sheet exam,gpt-4.1-mini,N/A,N/A,N/A,N/A,0.039,Upload 0.01 + Exam 0.029
+Total,Large PDF + full sheet exam,gpt-4o,N/A,N/A,N/A,N/A,0.190,Upload 0.01 + Exam 0.180
+Monthly,100 exams only,gpt-4o-mini,N/A,N/A,N/A,N/A,1.10,No re-upload
+Monthly,100 exams only,gpt-4.1-nano,N/A,N/A,N/A,N/A,0.70,No re-upload
+Monthly,100 exams only,gpt-5-mini,N/A,N/A,N/A,N/A,3.30,No re-upload
+Monthly,100 exams only,gpt-4.1-mini,N/A,N/A,N/A,N/A,2.90,No re-upload
+Monthly,100 exams only,gpt-4o,N/A,N/A,N/A,N/A,18.00,No re-upload
+WorstCase,PDF Upload (50 MB max),text-embedding-3-small,0.02,N/A,1280000,N/A,0.026,1600 chunks x 800 tokens
+WorstCase,PDF Upload (50 MB max),text-embedding-3-large,0.13,N/A,1280000,N/A,0.166,If embed model switched
+WorstCase,Exam (40 ch 32x50 2 retries),gpt-4.1-nano,0.10,0.40,220000,32000,0.035,API max stress
+WorstCase,Exam (40 ch 32x50 2 retries),gpt-4o-mini,0.15,0.60,220000,32000,0.052,API max stress default model
+WorstCase,Exam (40 ch 32x50 2 retries),gpt-5-mini,0.25,2.00,220000,32000,0.119,API max stress
+WorstCase,Exam (40 ch 32x50 2 retries),gpt-4.1-mini,0.40,1.60,220000,32000,0.139,API max stress
+WorstCase,Exam (40 ch 32x50 2 retries),gpt-4o,2.50,10.00,220000,32000,0.870,API max stress
+WorstCase,Upload + Exam combined,gpt-4o-mini,N/A,N/A,N/A,N/A,0.078,0.026 upload + 0.052 exam
+RealisticWorst,Per upload (125 pages),text-embedding-3-small,0.02,N/A,100000,N/A,0.002,Common heavy chapter
+RealisticWorst,Per exam (25 Q 1 attempt),gpt-4o-mini,0.15,0.60,12000,15000,0.011,Full sheet one chapter
+RealisticWorst,Upload + Exam combined,gpt-4o-mini,N/A,N/A,N/A,N/A,0.013,Typical dashboard ~0.01+0.01
