@@ -67,9 +67,9 @@ def build_exam_prompt(payload: dict, context_chunks: list[dict]) -> str:
     )
 
     return f"""
-You are an expert school exam setter.
-Generate questions strictly from the context.
-Do not invent facts outside context.
+You are an expert school exam setter known for writing outstanding, publication-quality papers.
+Every question must be clear, fair, engaging, and worth asking — not generic filler.
+Generate questions strictly from the context. Do not invent facts outside context.
 
 Payload:
 {payload}
@@ -78,6 +78,39 @@ Payload:
 
 Context chunks:
 {context}
+
+Question quality (HIGH STANDARD — EVERY QUESTION MUST EARN ITS PLACE):
+- Write questions a skilled teacher would proudly put on a real exam paper.
+- Each question must test meaningful understanding of the chapter material — concepts,
+  relationships, applications, definitions, processes, or cause-and-effect — not trivial
+  copy-paste of a single sentence from context.
+- Use clear, age-appropriate language. Avoid vague stems like "Which is correct?" or
+  "What is mentioned?" — make the learner know exactly what is being asked.
+- Calibrate difficulty honestly to each row's `difficultyLevel`:
+    VERY_EASY / EASY  — direct recall, simple identification, one-step reasoning.
+    MEDIUM            — connect two ideas, compare, classify, or apply a concept.
+    HARD / VERY_HARD  — multi-step reasoning, inference, or synthesis from context.
+- MCQ: write one unambiguous correct answer. Distractors must be plausible, distinct,
+  and grounded in context — never silly, identical, or obviously wrong.
+- TOF: statements must be precise and test a real fact or misconception from context.
+- FIB: blanks must target key terms or values that matter; avoid arbitrary word removal.
+- MTF: pair related but distinct items; left and right columns should require real matching
+  skill, not trivial one-to-one labels.
+- DES: prompts should invite structured explanation or analysis, not one-word answers.
+- Prefer varied cognitive angles across the paper (define, explain, apply, compare, identify,
+  reason) while staying within the requested types and difficulty rows.
+
+Uniqueness (NO REPETITION — EACH QUESTION MUST BE DISTINCT):
+- Every question in the paper must cover a DIFFERENT concept, fact, example, or angle
+  from the context. No two questions may feel like the same question rephrased.
+- Do NOT repeat the same stem, keyword, definition, example, or page focus across questions.
+- Do NOT ask about the same named entity, formula, date, or process twice in different words.
+- When multiple questions share the same `(type, difficulty)` row, spread them across
+  different context chunks, subtopics, and pages — maximize coverage of the chapter material.
+- MCQ options across the whole exam must not reuse the same distractor text in multiple questions.
+- MTF pairs must not duplicate left/right text used elsewhere in the paper.
+- Before finalizing, mentally scan all {total_required} top-level question blocks: if any two
+  overlap in focus or wording, rewrite the weaker one to target fresh content from context.
 
 Guardrails (DO NOT HALLUCINATE — ZERO TOLERANCE):
 - Do NOT invent any fact, number, date, name, definition, formula, or quotation
@@ -146,7 +179,9 @@ Rules:
 - Ensure final JSON matches schema exactly.
 - Add per-question sources with book_id, chapter, page.
 - Treat `description` as teacher guidance (focus/topics/style/constraints), not as chapter content.
-- If the payload lists multiple `chapters`, draw questions fairly across all of them using the provided context chunks.
+- If the payload lists multiple `chapters`, draw questions fairly across all of them using the provided context chunks — and ensure questions from different chapters are genuinely distinct in topic.
+- In `summary`, briefly note how the paper balances quality, difficulty, and topic coverage.
+- In `analysis`, briefly note uniqueness choices (e.g. which subtopics were covered and how repetition was avoided).
 - For each non-MTF question include at the top level: `questionCode` (from the global Q1..Q{total_blocks} sequence), `type`, `difficulty`, `text`, `displayOrder`.
 - MCQ options must be objects with: optionLabel, text, displayOrder. You MUST also set `correctOption` to the optionLabel of the one correct choice (e.g. `"B"`).
 - TOF: set boolean `answer` (true if the statement is correct, false if incorrect). Put the statement text in `text` (or legacy `statement` which is copied to `text`).
@@ -218,6 +253,8 @@ call. Do not add, rename, or omit fields.
 Final self-check before emitting JSON:
 - Output is a single JSON object — no prose, no markdown fences.
 - Output validates against the ExamResponse JSON Schema above (no extra keys).
+- Every question is high quality: clear stem, fair difficulty, meaningful learning target.
+- No two questions duplicate the same concept, fact, or phrasing — each is unique.
 - len(top-level questions[]) == {total_blocks}.
 - For each non-MTF row, count of top-level questions with matching (type, difficulty)
   equals that row's `numberOfQuestions`.
