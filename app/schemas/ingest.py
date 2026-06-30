@@ -47,3 +47,30 @@ class ChunkDocument(BaseModel):
             "chunk_index": self.chunk_index,
             "text": self.text,
         }
+
+
+class BatchChapterResult(BaseModel):
+    """Per-chapter outcome from ``POST /books/upload-zip``."""
+
+    file: str
+    chapter: int
+    status: str
+    book_id: str | None = None
+    chunks_upserted: int | None = None
+    error: str | None = None
+
+
+class BatchUploadResponse(BaseModel):
+    """Response for ``POST /books/upload-zip``."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: str
+    message: str
+    publication: int
+    class_id: int = Field(alias="class")
+    subject: int
+    total_chapters: int
+    successful: int
+    failed: int
+    results: list[BatchChapterResult]

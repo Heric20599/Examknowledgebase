@@ -47,6 +47,38 @@ Indexed metadata uses **string** values: **`class`** (class id), **`subject`**, 
 
 Upload API is synchronous and returns completion details directly (no `job_id` polling).
 
+### Batch upload (ZIP)
+
+Upload many chapter PDFs for one subject in a single request with **`POST /books/upload-zip`**.
+
+**Only the ZIP file is required** — no form fields for `class`, `subject`, or `publication`.
+
+**ZIP layout:**
+
+```text
+1_1_1.zip
+├── 1.pdf
+├── 2.pdf
+└── 3.pdf
+```
+
+Filename format: `classid_publicationid_subjectid.zip`
+
+- `1_1_1.zip` means `class=1`, `publication=1`, `subject=1`
+- Inside the ZIP, name chapter PDFs as `1.pdf`, `2.pdf`, `3.pdf`, etc.
+- These become chapters `1`, `2`, `3` automatically
+
+```bash
+curl -X POST "http://127.0.0.1:8000/books/upload-zip" ^
+  -F "file=@1_1_1.zip"
+```
+
+In Swagger UI (`/docs`), choose **POST /books/upload-zip**, select your ZIP, and click Execute. Leave other fields empty — they are not used.
+
+**Optional legacy:** a ZIP may still include `manifest.json` with `class`, `subject`, `publication` if the filename does not follow the `classid_publicationid_subjectid.zip` pattern.
+
+Response includes per-chapter results (`book_id`, `chunks_upserted`, or `error`). Overall `status` is `completed`, `partial`, or `failed`. Each PDF is still limited to **`max_pdf_mb`** (default 50 MB).
+
 ## 4) Generate exam
 
 JSON body (ids must match what you indexed; strings like `"1"` are accepted and coerced to integers):
