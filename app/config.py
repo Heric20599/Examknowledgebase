@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     chunk_size: int = 800
     chunk_overlap: int = 120
     max_pdf_mb: int = 50
+    max_zip_mb: int = 200
+    ingest_batch_size: int = 64
 
     # In-process keep-alive loop. If keepalive_url is set, the app pings it on
     # an interval from inside the FastAPI lifespan. Leave blank to disable.

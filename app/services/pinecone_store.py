@@ -45,6 +45,13 @@ def _index(pc: Pinecone, index_name: str):
     return pc.Index(index_name)
 
 
+def _drop_chunk_text(md: dict) -> dict:
+    """Return metadata without the large `text` field when callers do not need it."""
+    if not md or "text" not in md:
+        return md
+    return {k: v for k, v in md.items() if k != "text"}
+
+
 def upsert_chunks(pc: Pinecone, index_name: str, chunks: list[ChunkDocument], vectors: list[list[float]]) -> int:
     idx = _index(pc, index_name)
     payload = []
@@ -72,7 +79,7 @@ def list_books(pc: Pinecone, index_name: str, probe_vector: list[float], top_k: 
     res = idx.query(vector=probe_vector, top_k=top_k, include_metadata=True)
     grouped: dict[str, dict] = {}
     for m in res.get("matches", []):
-        md = m.get("metadata") or {}
+        md = _drop_chunk_text(m.get("metadata") or {})
         book_id = md.get("book_id")
         if not book_id:
             continue
@@ -111,7 +118,7 @@ def get_book_overview(pc: Pinecone, index_name: str, probe_vector: list[float], 
     pages = set()
     sample = None
     for m in matches:
-        md = m.get("metadata") or {}
+        md = _drop_chunk_text(m.get("metadata") or {})
         sample = sample or md
         chapter = md.get("chapter")
         chapter_name = md.get("chapter_name")
@@ -150,7 +157,7 @@ def list_chapters_for_book(pc: Pinecone, index_name: str, probe_vector: list[flo
     )
     data = defaultdict(set)
     for m in res.get("matches", []):
-        md = m.get("metadata") or {}
+        md = _drop_chunk_text(m.get("metadata") or {})
         if md.get("chapter") is not None:
             data[int(md["chapter"])].add(md.get("chapter_name", f"Chapter {md['chapter']}"))
     return [{"chapter": ch, "chapter_names": sorted(names)} for ch, names in sorted(data.items())]

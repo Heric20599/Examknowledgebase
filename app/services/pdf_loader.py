@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from functools import lru_cache
 from pathlib import Path
 
 import tiktoken
@@ -11,12 +13,17 @@ from app.schemas.ingest import ChunkDocument
 CHAPTER_PATTERN = re.compile(r"^\s*chapter\s+(\d+)\s*[:\-\s]*(.*)$", re.IGNORECASE)
 
 
+@lru_cache(maxsize=1)
+def _tokenizer():
+    return tiktoken.get_encoding("cl100k_base")
+
+
 def _normalize_text(value: str) -> str:
     return " ".join(value.strip().split())
 
 
 def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
-    enc = tiktoken.get_encoding("cl100k_base")
+    enc = _tokenizer()
     tokens = enc.encode(text)
     if not tokens:
         return []
@@ -34,7 +41,7 @@ def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
     return chunks
 
 
-def pdf_to_chunk_documents(
+def iter_pdf_chunk_documents(
     pdf_path: str | Path,
     *,
     book_id: str,
@@ -45,9 +52,9 @@ def pdf_to_chunk_documents(
     default_chapter_name: str | None,
     chunk_size: int = 800,
     chunk_overlap: int = 120,
-) -> list[ChunkDocument]:
+) -> Iterator[ChunkDocument]:
+    """Yield chunk documents page-by-page to keep peak memory low."""
     reader = PdfReader(str(pdf_path))
-    documents: list[ChunkDocument] = []
 
     chapter_num = default_chapter or 1
     chapter_name = _normalize_text(default_chapter_name or "General")
@@ -68,18 +75,42 @@ def pdf_to_chunk_documents(
         chunks = _chunk_text(page_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         for chunk_idx, chunk in enumerate(chunks):
             doc_id = f"{book_id}::ch{chapter_num}::p{page_i}::c{chunk_idx}"
-            documents.append(
-                ChunkDocument(
-                    id=doc_id,
-                    text=chunk,
-                    class_str=class_str,
-                    subject=subject,
-                    book_id=book_id,
-                    publication=publication,
-                    chapter=chapter_num,
-                    chapter_name=chapter_name,
-                    page=page_i,
-                    chunk_index=chunk_idx,
-                )
+            yield ChunkDocument(
+                id=doc_id,
+                text=chunk,
+                class_str=class_str,
+                subject=subject,
+                book_id=book_id,
+                publication=publication,
+                chapter=chapter_num,
+                chapter_name=chapter_name,
+                page=page_i,
+                chunk_index=chunk_idx,
             )
-    return documents
+
+
+def pdf_to_chunk_documents(
+    pdf_path: str | Path,
+    *,
+    book_id: str,
+    class_str: str,
+    subject: str,
+    publication: str,
+    default_chapter: int | None,
+    default_chapter_name: str | None,
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+) -> list[ChunkDocument]:
+    return list(
+        iter_pdf_chunk_documents(
+            pdf_path,
+            book_id=book_id,
+            class_str=class_str,
+            subject=subject,
+            publication=publication,
+            default_chapter=default_chapter,
+            default_chapter_name=default_chapter_name,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+    )

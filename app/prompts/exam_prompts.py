@@ -62,7 +62,7 @@ def build_exam_prompt(payload: dict, context_chunks: list[dict]) -> str:
     # emit today — automatically kept in sync with app/schemas/exam.py.
     response_schema_json = json.dumps(
         ExamResponse.model_json_schema(),
-        indent=2,
+        separators=(",", ":"),
         ensure_ascii=False,
     )
 

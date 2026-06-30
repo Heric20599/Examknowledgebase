@@ -13,11 +13,31 @@ from app.services.ingest_book import ingest_pdf_from_path
 
 router = APIRouter(prefix="/books", tags=["ingest"])
 
+_STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB
+
 
 def _temp_dir() -> Path:
     temp_dir = Path("tmp_uploads")
     temp_dir.mkdir(parents=True, exist_ok=True)
     return temp_dir
+
+
+async def _stream_upload_to_path(upload: UploadFile, dest: Path, *, max_bytes: int) -> int:
+    """Write upload to disk in chunks; raise HTTPException 413 if over max_bytes."""
+    written = 0
+    with dest.open("wb") as fh:
+        while True:
+            chunk = await upload.read(_STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Upload too large. Max allowed is {max_bytes // (1024 * 1024)} MB",
+                )
+            fh.write(chunk)
+    return written
 
 
 @router.post("/upload")
@@ -30,16 +50,11 @@ async def upload_book(
     publication: int = Form(...),
 ):
     settings = request.app.state.settings
-    raw = await file.read()
-    size_mb = len(raw) / (1024 * 1024)
-    if size_mb > settings.max_pdf_mb:
-        raise HTTPException(status_code=413, detail=f"PDF too large. Max allowed is {settings.max_pdf_mb} MB")
-
+    max_bytes = settings.max_pdf_mb * 1024 * 1024
     temp_path = _temp_dir() / f"{uuid.uuid4()}-{file.filename}"
-    with temp_path.open("wb") as fh:
-        fh.write(raw)
 
     try:
+        await _stream_upload_to_path(file, temp_path, max_bytes=max_bytes)
         return ingest_pdf_from_path(
             temp_path,
             publication=publication,
@@ -79,12 +94,16 @@ async def upload_books_zip(
         raise HTTPException(status_code=400, detail="Upload a .zip file.")
 
     original_filename = Path(file.filename).name
-    raw = await file.read()
     zip_path = _temp_dir() / f"{uuid.uuid4()}-{original_filename}"
     extract_dir: Path | None = None
+    max_bytes = settings.max_zip_mb * 1024 * 1024
 
-    with zip_path.open("wb") as fh:
-        fh.write(raw)
+    try:
+        await _stream_upload_to_path(file, zip_path, max_bytes=max_bytes)
+    except HTTPException:
+        if zip_path.exists():
+            zip_path.unlink(missing_ok=True)
+        raise
 
     try:
         scope, chapter_items, extract_dir = prepare_batch_upload(

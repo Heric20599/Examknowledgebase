@@ -24,6 +24,9 @@ from app.services.pinecone_store import (
 
 logger = logging.getLogger(__name__)
 
+# Cap broad Pinecone fallbacks during chapter resolution (metadata includes full chunk text).
+_CHAPTER_RESOLVE_FALLBACK_TOP_K = 100
+
 
 def _normalize_text(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", " ", value.strip().lower())
@@ -1005,7 +1008,7 @@ def _resolve_chapter_by_number(
             pc=pc,
             index_name=index_name,
             vector=probe_vector,
-            top_k=900,
+            top_k=_CHAPTER_RESOLVE_FALLBACK_TOP_K,
             metadata_filter={"chapter": {"$eq": chapter_number}},
         )
         requested_class = _normalize_class_id(class_str)
@@ -1075,7 +1078,7 @@ def _resolve_chapter_match(
         pc=pc,
         index_name=index_name,
         vector=probe_vector,
-        top_k=600,
+        top_k=_CHAPTER_RESOLVE_FALLBACK_TOP_K,
         metadata_filter={},
     )
 
@@ -1119,7 +1122,7 @@ def _resolve_chapter_match(
             pc=pc,
             index_name=index_name,
             vector=probe_vector,
-            top_k=900,
+            top_k=_CHAPTER_RESOLVE_FALLBACK_TOP_K,
             metadata_filter=scoped_filter,
         )
         requested_tokens = set(requested_normalized.split())

@@ -9,8 +9,23 @@ from app.config import Settings
 from app.schemas.ingest import ChunkDocument
 from app.services.book_scope import scoped_book_id
 from app.services.embeddings import embed_texts
-from app.services.pdf_loader import pdf_to_chunk_documents
+from app.services.pdf_loader import iter_pdf_chunk_documents
 from app.services.pinecone_store import upsert_chunks
+
+
+def _upsert_document_batch(
+    batch: list[ChunkDocument],
+    *,
+    openai_client: OpenAI,
+    embed_model: str,
+    pinecone_client: Pinecone,
+    index_name: str,
+) -> int:
+    vectors = embed_texts(openai_client, embed_model, [d.text for d in batch])
+    try:
+        return upsert_chunks(pinecone_client, index_name, batch, vectors)
+    finally:
+        del vectors
 
 
 def ingest_pdf_from_path(
@@ -24,7 +39,7 @@ def ingest_pdf_from_path(
     openai_client: OpenAI,
     pinecone_client: Pinecone,
 ) -> dict:
-    """Chunk, embed, and upsert one PDF. Returns the same shape as POST /books/upload."""
+    """Chunk, embed, and upsert one PDF in batches. Returns the same shape as POST /books/upload."""
     size_mb = pdf_path.stat().st_size / (1024 * 1024)
     if size_mb > settings.max_pdf_mb:
         raise ValueError(f"PDF too large ({size_mb:.1f} MB). Max allowed is {settings.max_pdf_mb} MB")
@@ -35,7 +50,11 @@ def ingest_pdf_from_path(
         subject=subject,
         chapter=chapter,
     )
-    docs: list[ChunkDocument] = pdf_to_chunk_documents(
+    batch_size = max(1, settings.ingest_batch_size)
+    batch: list[ChunkDocument] = []
+    chunks_upserted = 0
+
+    for doc in iter_pdf_chunk_documents(
         pdf_path,
         book_id=book_id,
         class_str=str(class_id),
@@ -45,9 +64,27 @@ def ingest_pdf_from_path(
         default_chapter_name=f"Chapter {chapter}",
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
-    )
-    vectors = embed_texts(openai_client, settings.openai_embed_model, [d.text for d in docs])
-    chunks_upserted = upsert_chunks(pinecone_client, settings.pinecone_index, docs, vectors)
+    ):
+        batch.append(doc)
+        if len(batch) >= batch_size:
+            chunks_upserted += _upsert_document_batch(
+                batch,
+                openai_client=openai_client,
+                embed_model=settings.openai_embed_model,
+                pinecone_client=pinecone_client,
+                index_name=settings.pinecone_index,
+            )
+            batch.clear()
+
+    if batch:
+        chunks_upserted += _upsert_document_batch(
+            batch,
+            openai_client=openai_client,
+            embed_model=settings.openai_embed_model,
+            pinecone_client=pinecone_client,
+            index_name=settings.pinecone_index,
+        )
+
     return {
         "status": "completed",
         "message": "Book uploaded and indexed successfully.",
